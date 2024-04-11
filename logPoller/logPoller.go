@@ -4,6 +4,7 @@ import (
 	"context"
 	"erinaceus_data_feeds/client"
 	aggregator "erinaceus_data_feeds/contract"
+	diffchecker "erinaceus_data_feeds/diffChecker"
 	"erinaceus_data_feeds/services/timer"
 	wallet_service "erinaceus_data_feeds/services/wallet"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/sirupsen/logrus"
 )
@@ -34,17 +36,21 @@ func (f *CustomFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 }
 
 type LogPoller struct {
-	client            *client.Client
-	contractAddress   common.Address
-	replayFromBlock   uint64
-	eventSignatures   []common.Hash
-	ReplayFromBlock   uint64
-	pendingRound      uint64
-	latestBlockNumber uint64
-	Mu                sync.Mutex
-	logger            *logrus.Logger
-	aggregator        *aggregator.Aggregator
-	timer             *timer.Timer
+	client          *client.Client
+	contractAddress common.Address
+	replayFromBlock uint64
+	fromPoller      bool
+	pollTicker      time.Ticker
+	eventSignatures []common.Hash
+	ReplayFromBlock uint64
+	walletService   *wallet_service.WalletService
+	logchanel       chan *aggregator.AggregatorNewRound
+	pendingRound    uint32
+	latestAnswer    float64
+	Mu              sync.Mutex
+	logger          *logrus.Logger
+	aggregator      *aggregator.Aggregator
+	timer           *timer.Timer
 }
 
 func NewLogPoller(client *client.Client, replayFromBlock uint64, contractAddress common.Address, walletService *wallet_service.WalletService, timer *timer.Timer) (*LogPoller, error) {
@@ -53,7 +59,7 @@ func NewLogPoller(client *client.Client, replayFromBlock uint64, contractAddress
 		return nil, err
 	}
 
-	aggregator, err := aggregator.NewAggregator(contractAddress, client.EthClient)
+	aggregatorContract, err := aggregator.NewAggregator(contractAddress, client.EthClient)
 	if err != nil {
 		return &LogPoller{}, fmt.Errorf("failed to create aggregator instance %v", err)
 	}
@@ -78,9 +84,16 @@ func NewLogPoller(client *client.Client, replayFromBlock uint64, contractAddress
 	return &LogPoller{
 		client:          client,
 		contractAddress: contractAddress,
+
 		replayFromBlock: replayFromBlock,
 		logger:          logger,
-		aggregator:      aggregator,
+		fromPoller:      false,
+		pendingRound:    uint32(0),
+		walletService:   walletService,
+		latestAnswer:    0.0,
+		pollTicker:      *time.NewTicker(30 * time.Second),
+		logchanel:       make(chan *aggregator.AggregatorNewRound),
+		aggregator:      aggregatorContract,
 		eventSignatures: []common.Hash{newRoundSig, answerUpdatedSig},
 		timer:           timer,
 	}, nil
@@ -91,9 +104,13 @@ func (lp *LogPoller) PollLogs() error {
 		Addresses: []common.Address{lp.contractAddress},
 		Topics:    [][]common.Hash{lp.eventSignatures},
 		FromBlock: new(big.Int).SetUint64(lp.ReplayFromBlock),
-		ToBlock:   new(big.Int).SetUint64(lp.GetLatestBlockNumber()),
+		ToBlock:   nil,
 	}
-
+	lb, err := lp.client.EthClient.BlockNumber(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed to get latest block %v", err)
+	}
+	lp.replayFromBlock = lb
 	logs, err := lp.client.FilterLogs(context.Background(), query)
 	if err != nil {
 		errorMsg := fmt.Sprintf("error filter logs reason : %s", err)
@@ -104,46 +121,162 @@ func (lp *LogPoller) PollLogs() error {
 	if err != nil {
 		return fmt.Errorf("failed to get latest round Id %v", err)
 	}
-	lp.logger.Infof("New Round Id %d", recentRoundId)
-	lp.logger.Infof("got %d request from %d to %d blocks", len(logs), lp.replayFromBlock, lp.GetLatestBlockNumber())
 
 	for _, log := range logs {
 		newRound, err := lp.aggregator.ParseNewRound(log)
 		if err != nil {
 			continue
 		}
-		lp.logger.Infof("Round id inLog is %d", newRound.RoundId)
 		if newRound.RoundId.Cmp(recentRoundId) != -1 {
-			lp.logger.Info("got new round request")
+			lp.logchanel <- newRound
 		}
 	}
-	// lp.logger.Infof("Got %d NewRound logs", len(arr))
 	return nil
+}
+
+func (lp *LogPoller) StartPollingLogs() {
+	for {
+		<-lp.pollTicker.C
+		lp.PollLogs()
+	}
 }
 
 func (lp *LogPoller) StartListeningForPrices() {
 	for {
 		select {
-		case price := <-lp.timer.PriceChan:
-			// Use the price
-			lp.logger.Infof("Received price: %f", price)
-			lp.timer.Ticker.Reset(10 * time.Second)
-			// Add more cases as needed, for example, a case to handle termination
+		case newRound := <-lp.logchanel:
+			lp.logger.WithFields(logrus.Fields{
+				"Started By": newRound.StartedBy,
+				"Started At": newRound.StartedAt,
+				"RoundID":    newRound.RoundId,
+			}).Info("Received new round request, trying to submit ...")
+			currentAnswer, err := lp.aggregator.LatestRoundData(nil)
+			if err != nil {
+				lp.logger.Errorf("failed to get latest round data %v", err)
+				continue
+			}
+			nextAnswer, err := lp.timer.FetchData()
+			if err != nil {
+				lp.logger.Errorf("failed to make http request %v", err)
+				continue
+			}
+			next := new(big.Int).SetUint64(uint64(nextAnswer * 100))
+			if diffchecker.CheckDifference(currentAnswer.Answer, next) {
+				lp.logger.WithFields(logrus.Fields{
+					"Current Answer": currentAnswer,
+					"Next Answer":    next,
+				}).Info("Met difference Submitting ...")
+				if err := lp.TrySubmit(0, next); err != nil {
+					lp.logger.Errorf("failed to submit difference %v", err)
+					continue
+				}
+				continue
+			}
+			if newRound.StartedBy == lp.walletService.Key.Address {
+				lp.logger.Info("log is our own, skiping ...")
+				continue
+			}
 
+			if err := lp.TrySubmit(uint32(newRound.RoundId.Uint64()), next); err != nil {
+				lp.logger.Errorf("failed to answer %v", err)
+				continue
+			}
+		case price := <-lp.timer.DrumbeatChan:
+			lp.logger.WithFields(logrus.Fields{
+				"Answer":    price,
+				"Timestamp": time.Now().UTC(),
+			}).Info("Received price with 2m interval")
+			nextAnswer, err := lp.timer.FetchData()
+			if err != nil {
+				lp.logger.Errorf("failed to make http request %v", err)
+				continue
+			}
+			next := new(big.Int).SetUint64(uint64(nextAnswer * 100))
+			if err := lp.TrySubmit(0, next); err != nil {
+				lp.logger.Errorf("failed to answer after 2 min %v", err)
+				continue
+			}
 		}
 	}
 }
 
-func (lp *LogPoller) SetLatestBlockNumber(blockNumber uint64) {
-	lp.Mu.Lock()
-	defer lp.Mu.Unlock()
-	lp.latestBlockNumber = blockNumber
+func (lp *LogPoller) TrySubmit(roundId uint32, answer *big.Int) error {
+	timeNow := time.Now()
+	lp.timer.Ticker1.Stop()
+	roundState, err := lp.aggregator.OracleRoundState(nil, lp.walletService.Key.Address, roundId)
+	if err != nil {
+		return fmt.Errorf("failed to get oracle sound state %v", err)
+	}
+	auth, err := bind.NewKeyedTransactorWithChainID(lp.walletService.Key.ToEcdsaPrivKey(), big.NewInt(4090))
+	if err != nil {
+		return fmt.Errorf("failed to create keyed transactor %v", err)
+	}
+	if roundState.EligibleToSubmit {
+		tx, err := lp.aggregator.Submit(auth, new(big.Int).SetUint64(uint64(roundState.RoundId)), answer)
+		if err != nil {
+			return fmt.Errorf("failed to submit %v", err)
+		}
+		lp.logger.WithFields(logrus.Fields{
+			"Tx":        tx,
+			"Timestamp": time.Now().UTC(),
+		}).Info("Trying to send transaction")
+
+		receipt, err := bind.WaitMined(context.Background(), lp.client.EthClient, tx)
+		if err != nil {
+			return fmt.Errorf("failed to wait tx to be mined %v", err)
+		}
+
+		if receipt.Status == 0x1 {
+			lp.logger.WithFields(logrus.Fields{
+				"Receipt":   receipt,
+				"Timestamp": time.Now().UTC(),
+			}).Info("Transaction successfully sent")
+			lp.pollTicker.Reset(30 * time.Second)
+			lp.timer.Ticker1.Reset(2 * time.Minute)
+		}
+	} else {
+		dur := time.Since(timeNow) + 2*time.Minute
+		lp.timer.Ticker1.Reset(dur)
+		return fmt.Errorf("not eligible to submit tx")
+	}
+	return nil
 }
 
-// getLastProcessedBlock returns the last processed block number
-func (lp *LogPoller) GetLatestBlockNumber() uint64 {
-	return lp.latestBlockNumber
-}
+// func (lp *LogPoller) setPendingRound(round uint32) {
+// 	lp.Mu.Lock()
+// 	defer lp.Mu.Unlock()
+// 	lp.pendingRound = round
+// }
+
+// func (lp *LogPoller) getPendingRound() uint32 {
+// 	return lp.pendingRound
+// }
+
+// func (lp *LogPoller) SetLatestBlockNumber(blockNumber uint64) {
+// 	lp.Mu.Lock()
+// 	defer lp.Mu.Unlock()
+// 	lp.latestBlockNumber = blockNumber
+// }
+
+// // getLastProcessedBlock returns the last processed block number
+// func (lp *LogPoller) GetLatestBlockNumber() uint64 {
+// 	return lp.latestBlockNumber
+// }
+
+// func (lp *LogPoller) checkIfWeStartedRound() bool {
+// 	lp.Mu.Lock()
+// 	defer lp.Mu.Unlock()
+// 	return lp.latestLog.StartedBy == lp.walletService.Key.Address
+// }
+
+// func (lp *LogPoller) setNewRoundLog(log *aggregator.AggregatorNewRound) {
+// 	lp.Mu.Lock()
+// 	defer lp.Mu.Unlock()
+// 	if log == nil {
+// 		return
+// 	}
+// 	lp.latestLog = log
+// }
 
 // func (lp *LogPoller) getFromCache(key string) (*erinaceus_vrf.ErinacuesVrfRandomWordsRequested, bool) {
 // 	lp.Mu.Lock()

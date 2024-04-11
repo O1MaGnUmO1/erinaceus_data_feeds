@@ -41,7 +41,7 @@ func (cl *Client) SubscribeNewHead(ctx context.Context, ch chan<- *types.Header)
 }
 
 func NewClient() (*Client, error) {
-	client, err := ethclient.Dial(os.Getenv("EC_NODE_WSURL"))
+	client, err := ethclient.Dial(os.Getenv("EC_NODE_URL"))
 	if err != nil {
 		fmt.Println("Failed to connect to the Ethereum client:", err)
 

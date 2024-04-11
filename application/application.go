@@ -1,9 +1,7 @@
 package application
 
 import (
-	"context"
 	"erinaceus_data_feeds/client"
-	"erinaceus_data_feeds/headtracker"
 	logpoller "erinaceus_data_feeds/logPoller"
 	"erinaceus_data_feeds/services/timer"
 	wallet_service "erinaceus_data_feeds/services/wallet"
@@ -36,7 +34,6 @@ type Application struct {
 	Client        *client.Client
 	LogPoller     *logpoller.LogPoller
 	WalletService *wallet_service.WalletService
-	HeadTracker   *headtracker.HeadTracker
 	Logger        *logrus.Logger
 }
 
@@ -60,15 +57,8 @@ func NewApplication() (*Application, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create application : Err=<%v>", err)
 	}
-	// replayFromBlock := replayFromBlock
-	// if os.Getenv("EC_REPLAY_FROM_BLOCK") != "" {
-	// 	replayFromBlock, err = strconv.ParseUint(os.Getenv("EC_REPLAY_FROM_BLOCK"), 10, 64)
-	// 	if err != nil {
-	// 		logrus.Errorf("failed to get replay block number will use deafult value %v", err)
-	// 	}
-	// }
 	walletService := wallet_service.NewWalletService(client)
-	contractAddress := common.HexToAddress("0x318E735e110265044508C5DC95B38C1074D43829")
+	contractAddress := common.HexToAddress(os.Getenv("EC_FEED_ADDRESS"))
 	timer, _ := timer.NewTimerService()
 
 	logpoller, err := logpoller.NewLogPoller(client, replayFromBlock, contractAddress, walletService, timer)
@@ -77,15 +67,15 @@ func NewApplication() (*Application, error) {
 		return nil, fmt.Errorf("failed to create log poller : Err=<%v>", err)
 	}
 	go timer.Start()
-	go logpoller.StartListeningForPrices()
+	go logpoller.StartPollingLogs()
 
-	headtracker := headtracker.NewHeadTracker(client, logpoller)
+	// headtracker := headtracker.NewHeadTracker(client, logpoller)
 	return &Application{
 		Client:        client,
 		LogPoller:     logpoller,
 		WalletService: walletService,
-		HeadTracker:   headtracker,
-		Logger:        logger,
+		// HeadTracker:   headtracker,
+		Logger: logger,
 	}, nil
 }
 
@@ -95,9 +85,5 @@ func (app *Application) Run() {
 		app.Logger.Errorf("failed to create FTN Key %v", err)
 	}
 	app.WalletService.PrintWalletDetails()
-
-	err = app.HeadTracker.Start(context.Background())
-	if err != nil {
-		fmt.Printf("error starting head tracker %v", err)
-	}
+	app.LogPoller.StartListeningForPrices()
 }

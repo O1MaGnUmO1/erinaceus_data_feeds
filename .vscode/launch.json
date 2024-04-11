@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "Launch Package",
+        "type": "go",
+        "request": "launch",
+        "mode": "debug",
+        "program": "${workspaceFolder}/main.go",
+        "env": {
+          // "EC_CONTRACT_ADDRESS":"0x2c84182973e0FBbF5887627A1CdAAA7A643dd10f",
+          "EC_NODE_WSURL":"wss://ws1.oasis.bahamutchain.com",
+          // "EC_VRF_KEY_JSON_PATH": "~/Downloads/test_vrf/vrf_key.json",
+          // "EC_FTN_KEY_JSON_PATH": "~/Downloads/test_vrf/ftn_key.json",
+          // "EC_VRF_KEY_PASSWORD":"albertalik1234567890",
+          // "EC_FTN_KEY_PASSWORD":"albertalik1234567890",
+        }     
+      }
+    ]
+  }
+  
