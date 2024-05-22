@@ -59,7 +59,6 @@ func NewAPIRequestDetails() *APIRequestDetails {
 
 type Timer struct {
 	interval     time.Duration
-	url          string
 	apiDetails   *APIRequestDetails
 	Ticker       *time.Ticker
 	Ticker1      *time.Ticker

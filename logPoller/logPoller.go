@@ -43,6 +43,7 @@ type LogPoller struct {
 	pollTicker      time.Ticker
 	eventSignatures []common.Hash
 	ReplayFromBlock uint64
+	NewHeadCh       chan uint64
 	walletService   *wallet_service.WalletService
 	logchanel       chan *aggregator.AggregatorNewRound
 	pendingRound    uint32
@@ -90,6 +91,7 @@ func NewLogPoller(client *client.Client, replayFromBlock uint64, contractAddress
 		fromPoller:      false,
 		pendingRound:    uint32(0),
 		walletService:   walletService,
+		NewHeadCh:       make(chan uint64),
 		latestAnswer:    0.0,
 		pollTicker:      *time.NewTicker(30 * time.Second),
 		logchanel:       make(chan *aggregator.AggregatorNewRound),
@@ -150,6 +152,10 @@ func (lp *LogPoller) StartListeningForPrices() {
 				"Started At": newRound.StartedAt,
 				"RoundID":    newRound.RoundId,
 			}).Info("Received new round request, trying to submit ...")
+			if newRound.StartedBy == lp.walletService.Key.Address {
+				lp.logger.Info("log is our own, skiping ...")
+				continue
+			}
 			currentAnswer, err := lp.aggregator.LatestRoundData(nil)
 			if err != nil {
 				lp.logger.Errorf("failed to get latest round data %v", err)
@@ -172,15 +178,24 @@ func (lp *LogPoller) StartListeningForPrices() {
 				}
 				continue
 			}
-			if newRound.StartedBy == lp.walletService.Key.Address {
-				lp.logger.Info("log is our own, skiping ...")
-				continue
-			}
+			lp.logger.WithFields(logrus.Fields{
+				"Round started by": newRound.StartedBy,
+				"Our Address":      lp.walletService.Key.Address,
+			}).Info()
+
 
 			if err := lp.TrySubmit(uint32(newRound.RoundId.Uint64()), next); err != nil {
 				lp.logger.Errorf("failed to answer %v", err)
 				continue
 			}
+		case head := <-lp.NewHeadCh:
+			query := ethereum.FilterQuery{
+				Addresses: []common.Address{lp.contractAddress},
+				Topics:    [][]common.Hash{lp.eventSignatures},
+				FromBlock: new(big.Int).SetUint64(lp.ReplayFromBlock),
+				ToBlock:   new(big.Int).SetUint64(head),
+			}
+
 		case price := <-lp.timer.DrumbeatChan:
 			lp.logger.WithFields(logrus.Fields{
 				"Answer":    price,
@@ -196,6 +211,30 @@ func (lp *LogPoller) StartListeningForPrices() {
 				lp.logger.Errorf("failed to answer after 2 min %v", err)
 				continue
 			}
+		}
+	}
+}
+
+func (lp *LogPoller) checkOurNewRoundLog() {
+	query := ethereum.FilterQuery{
+		Addresses: []common.Address{lp.contractAddress},
+		Topics:    [][]common.Hash{lp.eventSignatures},
+		FromBlock: new(big.Int).SetUint64(lp.ReplayFromBlock),
+		ToBlock: nil,
+	}
+	logs, err := lp.client.FilterLogs(context.Background(), query)
+	if err != nil {
+		errorMsg := fmt.Sprintf("error filter logs reason : %s", err)
+		lp.logger.Errorf(errorMsg)
+		return
+	}
+	for _, log := range logs {
+		newRound, err := lp.aggregator.ParseNewRound(log)
+		if err != nil {
+			continue
+		}
+		if newRound.StartedBy == lp.walletService.Key.Address {
+			lp.
 		}
 	}
 }
@@ -241,61 +280,3 @@ func (lp *LogPoller) TrySubmit(roundId uint32, answer *big.Int) error {
 	}
 	return nil
 }
-
-// func (lp *LogPoller) setPendingRound(round uint32) {
-// 	lp.Mu.Lock()
-// 	defer lp.Mu.Unlock()
-// 	lp.pendingRound = round
-// }
-
-// func (lp *LogPoller) getPendingRound() uint32 {
-// 	return lp.pendingRound
-// }
-
-// func (lp *LogPoller) SetLatestBlockNumber(blockNumber uint64) {
-// 	lp.Mu.Lock()
-// 	defer lp.Mu.Unlock()
-// 	lp.latestBlockNumber = blockNumber
-// }
-
-// // getLastProcessedBlock returns the last processed block number
-// func (lp *LogPoller) GetLatestBlockNumber() uint64 {
-// 	return lp.latestBlockNumber
-// }
-
-// func (lp *LogPoller) checkIfWeStartedRound() bool {
-// 	lp.Mu.Lock()
-// 	defer lp.Mu.Unlock()
-// 	return lp.latestLog.StartedBy == lp.walletService.Key.Address
-// }
-
-// func (lp *LogPoller) setNewRoundLog(log *aggregator.AggregatorNewRound) {
-// 	lp.Mu.Lock()
-// 	defer lp.Mu.Unlock()
-// 	if log == nil {
-// 		return
-// 	}
-// 	lp.latestLog = log
-// }
-
-// func (lp *LogPoller) getFromCache(key string) (*erinaceus_vrf.ErinacuesVrfRandomWordsRequested, bool) {
-// 	lp.Mu.Lock()
-// 	defer lp.Mu.Unlock()
-// 	value, ok := lp.Unfulfilled[key]
-// 	return value, ok
-// }
-
-// func (lp *LogPoller) addToCache(key string, value *erinaceus_vrf.ErinacuesVrfRandomWordsRequested) {
-// 	lp.Mu.Lock()
-// 	defer lp.Mu.Unlock()
-// 	lp.Unfulfilled[key] = value
-// }
-
-// func (lp *LogPoller) deleteFromCache(key string) {
-// 	lp.Mu.Lock()
-// 	defer lp.Mu.Unlock()
-// 	_, ok := lp.Unfulfilled[key]
-// 	if ok {
-// 		delete(lp.Unfulfilled, key)
-// 	}
-// }

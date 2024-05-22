@@ -1,7 +1,9 @@
 package application
 
 import (
+	"context"
 	"erinaceus_data_feeds/client"
+	"erinaceus_data_feeds/headtracker"
 	logpoller "erinaceus_data_feeds/logPoller"
 	"erinaceus_data_feeds/services/timer"
 	wallet_service "erinaceus_data_feeds/services/wallet"
@@ -35,6 +37,7 @@ type Application struct {
 	LogPoller     *logpoller.LogPoller
 	WalletService *wallet_service.WalletService
 	Logger        *logrus.Logger
+	HeadTracker   *headtracker.HeadTracker
 }
 
 func NewApplication() (*Application, error) {
@@ -66,16 +69,17 @@ func NewApplication() (*Application, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create log poller : Err=<%v>", err)
 	}
+	headTracker := headtracker.NewHeadTracker(client, logpoller)
 	go timer.Start()
 	go logpoller.StartPollingLogs()
+	go headTracker.Start(context.Background())
 
-	// headtracker := headtracker.NewHeadTracker(client, logpoller)
 	return &Application{
 		Client:        client,
 		LogPoller:     logpoller,
 		WalletService: walletService,
-		// HeadTracker:   headtracker,
-		Logger: logger,
+		HeadTracker:   headTracker,
+		Logger:        logger,
 	}, nil
 }
 
